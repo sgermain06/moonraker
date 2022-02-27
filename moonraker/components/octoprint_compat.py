@@ -5,7 +5,10 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
+from os import path
+
 import logging
+import socket
 
 # Annotation imports
 from typing import (
@@ -52,7 +55,11 @@ class OctoprintCompat:
             'webcamEnabled': config.getboolean('webcam_enabled', True),
         }
 
+        self.profile_name = config.get('profile_name', 'Default')
+        self.profile_model = config.get('profile_model', 'Default')
+
         # Local variables
+        self.fmgr: FileManager = self.server.lookup_component('file_manager')
         self.klippy_apis: APIComp = self.server.lookup_component('klippy_apis')
         self.heaters: Dict[str, Dict[str, Any]] = {}
         self.last_print_stats: Dict[str, Any] = {}
@@ -123,6 +130,8 @@ class OctoprintCompat:
             result: Dict[str, Any]
             sensors: List[str]
             result = await self.klippy_apis.query_objects({'heaters': None})
+            tmpSensors = result.get('heaters', {})
+            logging.info(f'Sensors: {tmpSensors}')
             sensors = result.get('heaters', {}).get('available_sensors', [])
         except self.server.error as e:
             logging.info(f'Error Configuring heaters: {e}')
@@ -130,20 +139,70 @@ class OctoprintCompat:
         # subscribe objects
         sub: Dict[str, Any] = {s: None for s in sensors}
         sub['print_stats'] = None
+        sub['virtual_sdcard'] = None
+        sub['configfile'] = None
         result = await self.klippy_apis.subscribe_objects(sub)
-        self.last_print_stats = result.get('print_stats', {})
+        self.last_print_stats = {
+            'print_stats': result.get('print_stats', {}),
+            'job_stats': result.get('virtual_sdcard', {}),
+        }
+        configfile = result.get('configfile', {}).get('config', {})
         if sensors:
-            self.heaters = {name: result.get(name, {}) for name in sensors}
+            for name in sensors:
+                self.heaters[name] = result.get(name, {})
+                heaterConfig = configfile.get(name, {})
+                if heaterConfig.get('gcode_id', None) == 'C':
+                    # Copy reference from the heater with the C gcode id to the chamber property in heaters.
+                    self.heaters['chamber'] = result.get(name, {})
+        logging.info(f'Heaters: {self.heaters}')
+
+    def _map_status_update(self, stats: Dict[str, Any]) -> None:
+
+        printer_state = self.printer_state()
+
+        if 'print_stats' in stats:
+            # handle everything related to the printer stats here
+            self.last_print_stats.update(stats.get('print_stats', {}))
+
+        if 'virtual_sdcard' in stats:
+            # handle everything related to virtual SD card here
+            job_stats = stats.get('virtual_sdcard', {})
+            self.last_print_stats.update({ 'job_stats': job_stats })
+            logging.info(f'[DEBUG] Job stats: {job_stats}')
+            if 'file_path' in job_stats:
+                file_path = path.basename(job_stats.get('file_path'))
+                logging.ingo(f'Found file path in sdcard message: {file_path}')
+                self.last_print_stats['job_stats'].update({ 'file_path': path.basename(job_stats.get('file_path'))})
+            self.last_print_stats['job_stats'].update({ 'print_time_origin': 'estimate' if job_stats['progress'] > 0 else None })
+
+        # Handle case where Moonraker was restarted while a print is going.
+        logging.info(f'Printer state: {printer_state}')
+        if printer_state in ['Printing', 'Paused']:
+            logging.info(f'Currently printing!')
+            if filename in self.last_print_stats:
+                metadata = self._get_file_metadata(self.last_print_stats.get('filename'))
+                logging.info(f'[DEBUG] Printer state metadata is {metadata}')
+                self.last_print_stats['job_stats'].update({
+                    'size': metadata.get('size', None),
+                    'origin': 'sdcard',
+                    'estimatedPrintTime': metadata.get('estimated_time', None),
+                })
+        else:
+            self.last_print_stats['job_stats'] = {}
+
+    def _get_file_metadata(self, filename: str) -> Dict[str, Any]:
+        logging.info(f'Requesting file metadata for {filename}')
+        return self.fmgr.get_file_metadata(filename)
 
     def _handle_status_update(self, status: Dict[str, Any]) -> None:
-        if 'print_stats' in status:
-            self.last_print_stats.update(status['print_stats'])
+        self._map_status_update(status)
         for heater_name, data in self.heaters.items():
             if heater_name in status:
                 data.update(status[heater_name])
 
     def printer_state(self) -> str:
         klippy_state = self.server.get_klippy_state()
+        logging.info(f'Klippy state: {klippy_state}')
         if klippy_state in ["disconnected", "startup"]:
             return 'Offline'
         elif klippy_state != 'ready':
@@ -152,7 +211,8 @@ class OctoprintCompat:
             'standby': 'Operational',
             'printing': 'Printing',
             'paused': 'Paused',
-            'complete': 'Operational'
+            'complete': 'Operational',
+            'cancelled': 'Operational',
         }.get(self.last_print_stats.get('state', 'standby'), 'Error')
 
     def printer_temps(self) -> Dict[str, Any]:
@@ -165,6 +225,8 @@ class OctoprintCompat:
                 except ValueError:
                     tool_no = 0
                 name = f'tool{tool_no}'
+            elif heater == 'chamber':
+                name = 'chamber'
             elif heater != "heater_bed":
                 continue
             temps[name] = {
@@ -255,19 +317,24 @@ class OctoprintCompat:
         """
         Get current job status
         """
+        logging.info(f'Job Info: {self.last_print_stats}')
         return {
             'job': {
-                'file': {'name': None},
-                'estimatedPrintTime': None,
-                'filament': {'length': None},
-                'user': None,
+                'file': {
+                    'name': self.last_print_stats.get('job_stats', {}).get('file_path', None),
+                    'size': self.last_print_stats.get('job_stats', {}).get('size', None),
+                    'origin': self.last_print_stats.get('job_stats', {}).get('origin', None),
+                },
+                'estimatedPrintTime': self.last_print_stats.get('job_stats', {}).get('estimatePrintTime', None),
+                'filament': {'length': self.last_print_stats.get('filament_used', 0.)},
+                'user': '_api',
             },
             'progress': {
-                'completion': None,
-                'filepos': None,
-                'printTime': None,
+                'completion': (self.last_print_stats.get('job_stats', {}).get('progress', 0.) * 100),
+                'filepos': self.last_print_stats.get('job_stats', {}).get('file_position', None),
+                'printTime': self.last_print_stats.get('job_stats', {}).get('estimatePrintTime', None),
                 'printTimeLeft': None,
-                'printTimeOrigin': None,
+                'printTimeOrigin': self.last_print_stats.get('job_stats', {}).get('print_time_origin', None),
             },
             'state': self.printer_state()
         }
@@ -323,13 +390,14 @@ class OctoprintCompat:
             'profiles': {
                 '_default': {
                     'id': '_default',
-                    'name': 'Default',
+                    'name': self.profile_name,
                     'color': 'default',
-                    'model': 'Default',
+                    'model': self.profile_model,
                     'default': True,
                     'current': True,
                     'heatedBed': 'heater_bed' in self.heaters,
                     'heatedChamber': 'chamber' in self.heaters,
+                    'resource': f'{web_request.full_url}{web_request.endpoint}',
                     'axes': {
                         'x': {
                             'speed': 6000.,

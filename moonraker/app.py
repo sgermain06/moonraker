@@ -612,10 +612,11 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                                 conn: Optional[WebSocket]
                                 ) -> Any:
         assert callable(self.callback)
+        full_url = '://'.join([self.request.protocol, self.request.host])
         return await self.callback(
             WebRequest(self.request.path, args, self.request.method,
                        conn=conn, ip_addr=self.request.remote_ip,
-                       user=self.current_user))
+                       user=self.current_user, full_url=full_url))
 
     async def _do_remote_request(self,
                                  args: Dict[str, Any],

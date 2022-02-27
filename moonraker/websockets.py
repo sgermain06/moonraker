@@ -54,14 +54,17 @@ class WebRequest:
                  action: Optional[str] = "",
                  conn: Optional[Subscribable] = None,
                  ip_addr: str = "",
-                 user: Optional[Dict[str, Any]] = None
+                 user: Optional[Dict[str, Any]] = None,
+                 full_url: str = None
                  ) -> None:
         self.endpoint = endpoint
         self.action = action or ""
         self.args = args
         self.conn = conn
+        self.full_url = full_url
         self.ip_addr: Optional[IPUnion] = None
         try:
+
             self.ip_addr = ipaddress.ip_address(ip_addr)
         except Exception:
             self.ip_addr = None
